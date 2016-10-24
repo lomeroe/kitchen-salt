@@ -88,19 +88,29 @@ module Kitchen
       def install_chef
         return unless config[:require_chef]
         chef_url = config[:chef_bootstrap_url]
-        omnibus_download_dir = config[:omnibus_cachier] ? '/tmp/vagrant-cache/omnibus_chef' : '/tmp'
-        <<-INSTALL
-          if [ ! -d "/opt/chef" ]
-          then
-            echo "-----> Installing Chef Omnibus (for busser/serverspec ruby support)"
-            mkdir -p #{omnibus_download_dir}
-            if [ ! -x #{omnibus_download_dir}/install.sh ]
+        if windows_os?
+          <<-POWERSHELL
+            if (-Not $(test-path c:\\opscode\\chef) { 
+              (New-Object net.webclient).DownloadFile(#{chef_url}, "c:\\temp\\chef_bootstrap.ps1")
+              write-host "-----> Installing Chef Omnibus (for busser/serverspec ruby support)" 
+              #{sudo('powershell')} c:\\temp\\chef_bootstrap.ps1
+            }
+          POWERSHELL   
+        else
+          omnibus_download_dir = config[:omnibus_cachier] ? '/tmp/vagrant-cache/omnibus_chef' : '/tmp'
+          <<-INSTALL
+            if [ ! -d "/opt/chef" ]
             then
-              do_download #{chef_url} #{omnibus_download_dir}/install.sh
+              echo "-----> Installing Chef Omnibus (for busser/serverspec ruby support)"
+              mkdir -p #{omnibus_download_dir}
+              if [ ! -x #{omnibus_download_dir}/install.sh ]
+              then
+                do_download #{chef_url} #{omnibus_download_dir}/install.sh
+              fi
+              #{sudo('sh')} #{omnibus_download_dir}/install.sh -d #{omnibus_download_dir}
             fi
-            #{sudo('sh')} #{omnibus_download_dir}/install.sh -d #{omnibus_download_dir}
-          fi
-        INSTALL
+          INSTALL
+        end
       end
 
       def create_sandbox
@@ -115,12 +125,21 @@ module Kitchen
 
       def init_command
         debug("Initialising Driver #{name} by cleaning #{config[:root_path]}")
-        "#{sudo('rm')} -rf #{config[:root_path]} ; mkdir -p #{config[:root_path]}"
+        if windows_os?
+          "rm ""#{config[:root_path]}"" -Recurse -Force; mkdir -Path ""#{config[:root_path]}"
+        else
+          "#{sudo('rm')} -rf #{config[:root_path]} ; mkdir -p #{config[:root_path]}"
+        end
       end
 
       def salt_command
         salt_version = config[:salt_version]
-        cmd = sudo("salt-call --config-dir=#{File.join(config[:root_path], config[:salt_config])} --local state.highstate")
+        if windows_os?
+          cmd = "c:\\salt\\salt-call.bat"
+        else
+          cmd = sudo("salt-call") 
+        end
+        cmd << " --config-dir=#{File.join(config[:root_path], config[:salt_config])} --local state.highstate"
         cmd << " --log-level=#{config[:log_level]}" if config[:log_level]
         cmd << " test=#{config[:dry_run]}" if config[:dry_run]
         if salt_version > RETCODE_VERSION || salt_version == 'latest'
@@ -140,16 +159,41 @@ module Kitchen
         # Unless we know we have a version that supports --retcode-passthrough
         # attempt to scan the output for signs of failure
         if config[:salt_version] <= RETCODE_VERSION
-          # scan the output for signs of failure, there is a risk of false negatives
-          fail_grep = 'grep -e Result.*False -e Data.failed.to.compile -e No.matching.sls.found.for'
+          patterns = ['"Result.*False"', '"Data.failed.to.compile"', '"No.matching.sls.found.for"']
+          if os_windows?
+            # powershell fail_grep
+            # scan the output for signs of failure, there is a risk of false negatives
+            fail_grep = "select-string -Quiet -Pattern @(#{patterns.join(",")})"
+            pipe_fail = ''
+            temp_folder = 'c:\\temp'
+            tee_command = "tee-object -filepath #{temp_folder}\\salt-call-output"
+            set_var_preface = '$'
+            stderr_out_redirect = '2`>`&1'
+            sed_command = "get-content #{temp_folder}\\salt-call-output | where-object {$_ -notmatch '#{fail_grep}'}"
+            var_eval = "if ( $SC -eq $true ) { exit $SC } ; if ( $EC -eq $false ) { exit 1 }; if ( $EC -eq $true) { exit 0 }"
+          else
+            # scan the output for signs of failure, there is a risk of false negatives
+            fail_grep = 'grep '
+            @patterns.each do |pattern|
+              fail_grep << " -e ${pattern}"
+            end
+            pipe_fail = 'set -o pipefail ;'
+            temp_folder = '/tmp'
+            tee_command = "tee #{temp_folder}/salt-call-output ; "
+            set_var_preface = ''
+            stderr_out_redirect = '2>&1'
+            sed_command = "(sed '/#{fail_grep}/d' /tmp/salt-call-output"
+            var_eval = '[ ${SC} -ne 0 ] && exit ${SC} ; [ ${EC} -eq 0 ] && exit 1 ; [ ${EC} -eq 1 ] && exit 0)'
+          end
           # capture any non-zero exit codes from the salt-call | tee pipe
-          cmd = 'set -o pipefail ; ' << salt_command
+          cmd = pipe_fail << salt_command
           # Capture the salt-call output & exit code
-          cmd << ' 2>&1 | tee /tmp/salt-call-output ; SC=$? ; echo salt-call exit code: $SC ;'
+          cmd << " #{stderr_out_redirect} | #{tee_command} ; #{set_var_preface}SC=$? ; echo salt-call exit code: $SC ;"
           # check the salt-call output for fail messages
-          cmd << " (sed '/#{fail_grep}/d' /tmp/salt-call-output | #{fail_grep} ; EC=$? ; echo salt-call output grep exit code ${EC} ;"
+          cmd << " #{sed_command} | #{fail_grep} ; #{set_var_preface}EC=$? ; echo salt-call output grep exit code ${EC} ;"
           # use the non-zer exit code from salt-call, then invert the results of the grep for failures
-          cmd << ' [ ${SC} -ne 0 ] && exit ${SC} ; [ ${EC} -eq 0 ] && exit 1 ; [ ${EC} -eq 1 ] && exit 0)'
+          cmd << var_eval 
+          debug("#{cmd}")
           cmd
         else
           salt_command         
