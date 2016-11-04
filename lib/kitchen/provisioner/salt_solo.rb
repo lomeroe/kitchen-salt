@@ -81,7 +81,11 @@ module Kitchen
           config[:salt_bootstrap_options] = "-P git v#{salt_version}"
         end
 
-        install_template = File.expand_path("./../install.erb", __FILE__)
+        if windows_os?
+          install_template = File.expand_path("./../install_win.erb", __FILE__)
+        else
+          install_template = File.expand_path("./../install.erb", __FILE__)
+        end
 
         ERB.new(File.read(install_template)).result(binding)
       end
@@ -89,19 +93,29 @@ module Kitchen
       def install_chef
         return unless config[:require_chef]
         chef_url = config[:chef_bootstrap_url]
-        omnibus_download_dir = config[:omnibus_cachier] ? '/tmp/vagrant-cache/omnibus_chef' : '/tmp'
-        <<-INSTALL
-          if [ ! -d "/opt/chef" ]
-          then
-            echo "-----> Installing Chef Omnibus (for busser/serverspec ruby support)"
-            mkdir -p #{omnibus_download_dir}
-            if [ ! -x #{omnibus_download_dir}/install.sh ]
+        if windows_os?
+          <<-POWERSHELL
+            if (-Not $(test-path c:\\opscode\\chef) { 
+              (New-Object net.webclient).DownloadFile("#{chef_url}", "c:\\temp\\chef_bootstrap.ps1")
+              write-host "-----> Installing Chef Omnibus (for busser/serverspec ruby support)" 
+              #{sudo('powershell')} c:\\temp\\chef_bootstrap.ps1
+            }
+          POWERSHELL
+        else
+          omnibus_download_dir = config[:omnibus_cachier] ? '/tmp/vagrant-cache/omnibus_chef' : '/tmp'
+          <<-INSTALL
+            if [ ! -d "/opt/chef" ]
             then
-              do_download #{chef_url} #{omnibus_download_dir}/install.sh
+              echo "-----> Installing Chef Omnibus (for busser/serverspec ruby support)"
+              mkdir -p #{omnibus_download_dir}
+              if [ ! -x #{omnibus_download_dir}/install.sh ]
+              then
+                do_download #{chef_url} #{omnibus_download_dir}/install.sh
+              fi
+              #{sudo('sh')} #{omnibus_download_dir}/install.sh -d #{omnibus_download_dir}
             fi
-            #{sudo('sh')} #{omnibus_download_dir}/install.sh -d #{omnibus_download_dir}
-          fi
-        INSTALL
+          INSTALL
+        end
       end
 
       def create_sandbox
@@ -116,17 +130,33 @@ module Kitchen
 
       def init_command
         debug("Initialising Driver #{name} by cleaning #{config[:root_path]}")
-        "#{sudo('rm')} -rf #{config[:root_path]} ; mkdir -p #{config[:root_path]}"
+        if windows_os?
+          "rm ""#{config[:root_path]}"" -Recurse -Force; mkdir -Path ""#{config[:root_path]}"
+        else
+          "#{sudo('rm')} -rf #{config[:root_path]} ; mkdir -p #{config[:root_path]}"
+        end
       end
 
       def salt_command
         salt_version = config[:salt_version]
-        cmd = sudo("salt-call --config-dir=#{File.join(config[:root_path], config[:salt_config])} --local state.highstate")
+        if windows_os?
+          #--file-root=#{File.join(config[:root_path], config[:salt_file_root].gsub('/', '\\'))} --pillar-root=#{File.join(config[:root_path], config[:salt_pillar_root].gsub('/', '\\'))}
+          salt_config_path = config[:salt_config].gsub('/', '\\')
+          cmd = "(get-content #{File.join(config[:root_path], salt_config_path, 'minion').gsub('/', '\\')}).replace(\"`$env`:TEMP\", $env:TEMP) | set-content #{File.join(config[:root_path], salt_config_path, 'minion').gsub('/', '\\')} ;"
+          cmd << " c:\\salt\\salt-call.bat"
+        else
+          cmd = sudo("salt-call")
+          salt_config_path = config[:salt_config]
+        end
+        cmd << " --config-dir=#{File.join(config[:root_path], salt_config_path)} --local state.highstate"
         cmd << " --log-level=#{config[:log_level]}" if config[:log_level]
         cmd << " test=#{config[:dry_run]}" if config[:dry_run]
         if salt_version > RETCODE_VERSION || salt_version == 'latest'
           # hope for the best and hope it works eventually
-          cmd += ' --retcode-passthrough'
+          cmd << ' --retcode-passthrough'
+        end
+        if windows_os?
+          cmd << ' ; exit $LASTEXITCODE'
         end
         cmd
       end
@@ -153,7 +183,7 @@ module Kitchen
           cmd << ' [ ${SC} -ne 0 ] && exit ${SC} ; [ ${EC} -eq 0 ] && exit 1 ; [ ${EC} -eq 1 ] && exit 0)'
           cmd
         else
-          salt_command         
+          salt_command
         end
       end
 
